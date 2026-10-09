@@ -288,7 +288,7 @@ async def skip_questions(page: Page, event_loop) -> None:
             continue
 
 
-async def wait_for_verify(page: Page, config, event_loop) -> None:
+async def wait_for_verify(page: Page, config, event_loop, modules=None) -> None:
     await page.wait_for_load_state("domcontentloaded")
     while True:
         try:
@@ -296,15 +296,27 @@ async def wait_for_verify(page: Page, config, event_loop) -> None:
             if not await has_visible_verification(page):
                 continue
             event_loop.clear()
-            logger.warn("检测到安全验证,请手动完成验证...", shift=True)
+            logger.warn("检测到安全验证,正在尝试自动处理...", shift=True)
             logger.event("安全验证", 状态="开始", 地址=page.url)
             wait_start = time.time()
-            if config.enableHideWindow:
-                await display_window(page)
-            await wait_until_verification_hidden(page)
+            # 先尝试自动过滑块(仅对易盾 yidun 滑块有效,失败不抛异常)
+            if config.enableAutoCaptcha and modules:
+                try:
+                    from modules.slider import slider_verify
+                    await slider_verify(page, modules)
+                except Exception as exc:
+                    logger.debug(
+                        f"自动过滑块异常: {logger.summarize_exception(exc)}"
+                    )
+            # 自动未通过则回退到人工等待
+            if await has_visible_verification(page):
+                logger.warn("自动验证未通过,请手动完成验证...", shift=True)
+                if config.enableHideWindow:
+                    await display_window(page)
+                await wait_until_verification_hidden(page)
+                if config.enableHideWindow:
+                    await hide_window(page)
             event_loop.set()
-            if config.enableHideWindow:
-                await hide_window(page)
             logger.info("安全验证已完成.", shift=True)
             logger.event("安全验证", 状态="完成", 耗时=f"{time.time() - wait_start:.1f}s")
             await asyncio.sleep(2)

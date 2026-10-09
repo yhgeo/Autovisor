@@ -81,6 +81,7 @@ async def run_course(
 
     start_time = time.time()
     paused_time = 0.0
+    consecutive_failures = 0
     for index, lesson in enumerate(lessons):
         position = f"{index + 1}/{len(lessons)}"
         playback_enabled.clear()
@@ -97,9 +98,14 @@ async def run_course(
             await lesson.click(timeout=LESSON_CLICK_TIMEOUT_MS)
             active = await wait_for_lesson_active(lesson, catalog)
         if not active:
+            consecutive_failures += 1
             logger.error(f"无法选中课时,目录类型: {catalog.name}")
             logger.event("课程结果", 结果="课时无法选中", 序号=position)
-            return CourseOutcome.FAILED
+            if consecutive_failures >= 5:
+                logger.error("连续 5 个课时无法选中,判定目录结构已变,终止本课程.")
+                return CourseOutcome.FAILED
+            continue
+        consecutive_failures = 0
 
         await page.wait_for_timeout(1000)
         title = await get_lesson_name(page, lesson, catalog)
