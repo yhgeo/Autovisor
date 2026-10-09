@@ -310,7 +310,10 @@ def start(config_obj=config):
     if os.name != "nt":
         modules = []
         missing = []
-        for package in packages:
+        # 上游 bug: 此处原为 `for package in packages:`, 而 `packages` 从未定义。
+        # 因 config.macos.ini.example 默认 enableAutoCaptcha=False, 该分支从未被
+        # 执行到, 所以长期未暴露; 在 Linux 上开启自动过滑块即触发 NameError。
+        for package in runtime_packages():
             try:
                 modules.append(import_module(mapping[package]))
             except ImportError:
