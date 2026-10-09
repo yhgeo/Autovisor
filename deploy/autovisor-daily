@@ -1,0 +1,113 @@
+#!/bin/bash
+# Autovisor 每日刷课调度脚本
+#
+# 设计要点（借鉴 fuckzhs-daily 的踩坑经验）：
+#   1. 每门课独立进程 —— Autovisor 的 main() 在某门课 FAILED 时会 break 整轮，
+#      拆进程才能保证「一门课卡住不拖垮其他课」。
+#   2. 每门课独立时限预算（习惯分要求每日每课 >= 25 分钟）。
+#   3. 课程之间留间隔，避免连续高强度行为。
+#   4. 全程 Xvfb，无可见窗口。
+#   5. 统计「撞到安全验证」的课程数，便于判断风控强度。
+#
+# 环境变量：
+#   AV_MINUTES    每门课预算（分钟），默认 26
+#   AV_GAP        课程之间间隔（秒），默认 60
+#   AV_DRY_RUN=1  只打印计划，不实际执行
+#
+# 用法：
+#   ./autovisor-daily.sh
+#   AV_MINUTES=30 ./autovisor-daily.sh
+#   AV_DRY_RUN=1 ./autovisor-daily.sh
+
+set -uo pipefail
+
+BASE=/opt/autovisor
+PY="$BASE/.venv/bin/python"
+LOG_DIR="$BASE/logs"
+RUN_DIR="$BASE/run"
+MINUTES="${AV_MINUTES:-26}"
+GAP="${AV_GAP:-60}"
+
+mkdir -p "$LOG_DIR" "$RUN_DIR"
+DAYLOG="$LOG_DIR/daily-$(date +%F).log"
+log() { echo "[$(date '+%F %T')] $*" | tee -a "$DAYLOG"; }
+
+# ---------- 从主配置提取课程 URL ----------
+MAIN_CONF="$BASE/config.ini"
+if [ ! -f "$MAIN_CONF" ]; then
+    log "错误: 找不到 $MAIN_CONF"
+    exit 1
+fi
+
+mapfile -t URLS < <(
+    grep -E '^[[:space:]]*URL[0-9]+[[:space:]]*=' "$MAIN_CONF" \
+    | sed -E 's/^[^=]*=[[:space:]]*//' \
+    | grep -v '^[[:space:]]*$'
+)
+
+if [ ${#URLS[@]} -eq 0 ]; then
+    log "错误: $MAIN_CONF 的 [course-url] 里没有有效 URL"
+    exit 1
+fi
+
+log "=== 每日刷课开始: ${#URLS[@]} 门课, 每门 ${MINUTES} 分钟, 间隔 ${GAP}s ==="
+
+# ---------- 为每门课生成独立配置 ----------
+gen_conf() {
+    local idx="$1" url="$2" out="$3"
+    "$PY" - "$MAIN_CONF" "$out" "$url" "$MINUTES" <<'PYEOF'
+import configparser, sys
+src, out, url, minutes = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+c = configparser.ConfigParser()
+c.optionxform = str
+c.read(src, encoding="utf-8")
+if "course-url" not in c:
+    c["course-url"] = {}
+c["course-url"] = {"URL1": url}
+if "course-option" not in c:
+    c["course-option"] = {}
+c["course-option"]["limitMaxTime"] = str(minutes)
+with open(out, "w", encoding="utf-8") as f:
+    c.write(f)
+PYEOF
+}
+
+ok=0; failed=0; captcha=0; idx=0
+for url in "${URLS[@]}"; do
+    idx=$((idx + 1))
+    conf="$RUN_DIR/course-${idx}.ini"
+    gen_conf "$idx" "$url" "$conf"
+
+    if [ "${AV_DRY_RUN:-0}" = "1" ]; then
+        log "--- [$idx/${#URLS[@]}] [dry-run] 预算 ${MINUTES}min  URL=${url:0:70} ---"
+        log "  [dry-run] xvfb-run $PY Autovisor.py --config $conf"
+        continue
+    fi
+
+    if [ "$idx" -gt 1 ]; then
+        log "课程间隔 ${GAP}s..."
+        sleep "$GAP"
+    fi
+    log "--- [$idx/${#URLS[@]}] 预算 ${MINUTES}min  URL=${url:0:70} ---"
+
+    out=$(cd "$BASE" && xvfb-run -a --server-args="-screen 0 1920x1080x24" \
+          "$PY" Autovisor.py --config "$conf" 2>&1)
+    rc=$?
+    { echo "===== 课程 $idx @ $(date '+%F %T') rc=$rc ====="; echo "$out"; } >> "$DAYLOG"
+
+    hit=0
+    if echo "$out" | grep -q "检测到安全验证"; then
+        hit=1; captcha=$((captcha + 1))
+    fi
+
+    if [ "$rc" -eq 0 ] && ! echo "$out" | grep -q "本轮因课时进度未确认而停止"; then
+        ok=$((ok + 1))
+        log "  ✓ 课程 $idx 正常结束$([ "$hit" = 1 ] && echo ' (期间出现过安全验证)')"
+    else
+        failed=$((failed + 1))
+        log "  ✗ 课程 $idx 异常结束 rc=$rc$([ "$hit" = 1 ] && echo ' (撞到安全验证)')"
+    fi
+done
+
+log "=== 结束: 正常 $ok / 异常 $failed / 撞验证 $captcha ==="
+exit 0
