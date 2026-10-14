@@ -32,6 +32,15 @@ mkdir -p "$LOG_DIR" "$RUN_DIR"
 DAYLOG="$LOG_DIR/daily-$(date +%F).log"
 log() { echo "[$(date '+%F %T')] $*" | tee -a "$DAYLOG"; }
 
+# ---------- 并发锁 ----------
+# 定时任务与手动运行撞车时, 两个 Autovisor 实例会各占约 690 MB,
+# 在 2 GB 内存的机器上必然 OOM。用 flock 保证同一时刻只有一个实例。
+exec 9>"$BASE/.autovisor.lock"
+if ! flock -n 9; then
+    log "已有实例正在运行, 本次跳过."
+    exit 0
+fi
+
 # ---------- 从主配置提取课程 URL ----------
 MAIN_CONF="$BASE/config.ini"
 if [ ! -f "$MAIN_CONF" ]; then

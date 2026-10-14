@@ -1,3 +1,4 @@
+import asyncio
 import time
 from enum import Enum
 
@@ -21,6 +22,9 @@ LESSON_CLICK_TIMEOUT_MS = 10_000
 # 目录节点在 detect_catalog 里刚确认过存在, 这里只做一次快速复核。
 CATALOG_ATTACH_TIMEOUT_MS = 5_000
 
+# 目录检测的硬上限(秒)。页面主线程被阻塞时内部 deadline 永远到不了, 靠这层兜底。
+CATALOG_DETECT_HARD_TIMEOUT_S = 45
+
 
 class CourseOutcome(Enum):
     COMPLETED = "completed"
@@ -28,9 +32,7 @@ class CourseOutcome(Enum):
     FAILED = "failed"
 
 
-async def detect_catalog_after_verification(
-    page: Page, course_url: str
-) -> CatalogSelectors:
+async def _detect_catalog_loop(page: Page, course_url: str) -> CatalogSelectors:
     deadline = time.monotonic() + 20
     while True:
         if await has_visible_verification(page):
@@ -45,6 +47,27 @@ async def detect_catalog_after_verification(
             )
         except RuntimeError:
             continue
+
+
+async def detect_catalog_after_verification(
+    page: Page, course_url: str
+) -> CatalogSelectors:
+    """带硬超时的课程目录检测。
+
+    内部循环的 deadline 依赖 await 能正常返回; 若页面主线程被风控脚本阻塞,
+    has_visible_verification 会永久挂起, deadline 永远到不了。这里在外面再包
+    一层硬超时, 保证调用方总能拿到结果(异常)而不是静默卡死。
+    """
+    try:
+        return await asyncio.wait_for(
+            _detect_catalog_loop(page, course_url),
+            timeout=CATALOG_DETECT_HARD_TIMEOUT_S,
+        )
+    except asyncio.TimeoutError as exc:
+        raise RuntimeError(
+            f"课程目录检测超时({CATALOG_DETECT_HARD_TIMEOUT_S}s): "
+            "页面可能被风控脚本阻塞, 无法执行任何脚本"
+        ) from exc
 
 
 async def run_course(

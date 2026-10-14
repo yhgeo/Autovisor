@@ -47,6 +47,13 @@ from modules.utils import (
 )
 from modules.version import __version__
 
+# init_page 把 Playwright 默认超时设为 24 小时, 页面被阻塞时 goto 会长时间不返回,
+# 因此所有导航都必须显式限时。
+COURSE_GOTO_TIMEOUT_MS = 60_000
+LOGIN_GOTO_TIMEOUT_MS = 60_000
+# 单门课运行的兜底余量(秒): limitMaxTime 之外再放宽这么多, 超时即跳过该课程。
+COURSE_RUN_GRACE_S = 600
+
 # 获取全局事件循环
 event_loop_verify = asyncio.Event()
 event_loop_answer = asyncio.Event()
@@ -158,7 +165,9 @@ async def init_page(p: Playwright, config, cookies) -> tuple[Page, BrowserContex
 
 async def auto_login(context: BrowserContext, page: Page, config, modules=None) -> None:
     wait_start = time.time()
-    await page.goto(config.login_url, wait_until="commit")
+    await page.goto(
+        config.login_url, wait_until="commit", timeout=LOGIN_GOTO_TIMEOUT_MS
+    )
     if not is_login_page(page.url):
         logger.info("检测到已登录,跳过登录步骤.")
         return
@@ -208,7 +217,11 @@ async def ensure_login(
 ) -> bool:
     if cookies:
         logger.info("正在校验 Cookies 登录状态...")
-        await page.goto(config.login_url, wait_until="domcontentloaded")
+        await page.goto(
+            config.login_url,
+            wait_until="domcontentloaded",
+            timeout=LOGIN_GOTO_TIMEOUT_MS,
+        )
         try:
             await wait_for_login_complete(page, timeout=10000)
         except TimeoutError:
@@ -277,45 +290,75 @@ async def main(config) -> bool:
                 logger.section(f"课程 {index}/{course_total}")
                 logger.context(课程序号=f"{index}/{course_total}", 课程地址=course_url)
                 logger.info("正在加载播放页...")
-                await page.goto(course_url, wait_until="commit")
-                await page.wait_for_timeout(1500)
-                if "login" in page.url:
-                    logger.warn(
-                        "播放页跳转到登录页, 当前登录状态已失效, 正在重新登录.",
+                # 单门课的故障(页面被风控阻塞/目录识别失败)不应拖垮整轮:
+                # 异常只跳过当前课程, 后续课程继续执行。
+                try:
+                    await page.goto(
+                        course_url,
+                        wait_until="commit",
+                        timeout=COURSE_GOTO_TIMEOUT_MS,
+                    )
+                    await page.wait_for_timeout(1500)
+                    if "login" in page.url:
+                        logger.warn(
+                            "播放页跳转到登录页, 当前登录状态已失效, 正在重新登录.",
+                            shift=True,
+                        )
+                        logger.event("登录失效", 地址=page.url)
+                        clear_cookies(COOKIE_PATH)
+                        remember_login_cookies(None)
+                        await ensure_login(context, page, None, config, modules)
+                        logger.info("重新进入播放页...")
+                        await page.goto(
+                            course_url,
+                            wait_until="commit",
+                            timeout=COURSE_GOTO_TIMEOUT_MS,
+                        )
+                        await page.wait_for_timeout(1500)
+
+                    catalog = await detect_catalog_after_verification(page, page.url)
+                    logger.info(f"检测到 {catalog.name} 课程目录.")
+                    logger.context(目录类型=catalog.name)
+                    logger.event("课程目录", 类型=catalog.name, 地址=page.url)
+                    await persist_login_cookies(context)
+                    await optimize_page(page, config, catalog)
+                    logger.info("页面优化完成!")
+                    if catalog.course_title:
+                        title_element = page.locator(catalog.course_title).first
+                        if await title_element.count():
+                            title = " ".join(
+                                (await title_element.text_content() or "").split()
+                            )
+                            if title:
+                                logger.info(f"当前课程:<<{title}>>")
+                                logger.context(课程名称=title)
+                                logger.event("当前课程", 名称=title)
+
+                    playback_enabled.clear()
+                    # 兜底看门狗: 课程进行中若页面被阻塞, 不能让整轮停摆。
+                    outcome = await asyncio.wait_for(
+                        run_course(page, catalog, config, logger, playback_enabled),
+                        timeout=config.limitMaxTime * 60 + COURSE_RUN_GRACE_S,
+                    )
+                    playback_enabled.clear()
+                    logger.event(
+                        "课程结果", 结果=outcome.value, 目录类型=catalog.name
+                    )
+                except Exception as exc:
+                    playback_enabled.clear()
+                    logger.log_exception(
+                        f"课程 {index}/{course_total} 执行异常, 已跳过并继续下一门.",
+                        exc,
                         shift=True,
                     )
-                    logger.event("登录失效", 地址=page.url)
-                    clear_cookies(COOKIE_PATH)
-                    remember_login_cookies(None)
-                    await ensure_login(context, page, None, config, modules)
-                    logger.info("重新进入播放页...")
-                    await page.goto(course_url, wait_until="commit")
-                    await page.wait_for_timeout(1500)
-
-                catalog = await detect_catalog_after_verification(page, page.url)
-                logger.info(f"检测到 {catalog.name} 课程目录.")
-                logger.context(目录类型=catalog.name)
-                logger.event("课程目录", 类型=catalog.name, 地址=page.url)
-                await persist_login_cookies(context)
-                await optimize_page(page, config, catalog)
-                logger.info("页面优化完成!")
-                if catalog.course_title:
-                    title_element = page.locator(catalog.course_title).first
-                    if await title_element.count():
-                        title = " ".join(
-                            (await title_element.text_content() or "").split()
-                        )
-                        if title:
-                            logger.info(f"当前课程:<<{title}>>")
-                            logger.context(课程名称=title)
-                            logger.event("当前课程", 名称=title)
-
-                playback_enabled.clear()
-                outcome = await run_course(
-                    page, catalog, config, logger, playback_enabled
-                )
-                playback_enabled.clear()
-                logger.event("课程结果", 结果=outcome.value, 目录类型=catalog.name)
+                    logger.event(
+                        "课程结果",
+                        结果="异常跳过",
+                        序号=f"{index}/{course_total}",
+                    )
+                    run_ok = False
+                    all_courses_complete = False
+                    continue
                 if outcome is CourseOutcome.FAILED:
                     logger.warn("课程未确认完成,已停止本轮运行.", shift=True)
                     run_ok = False

@@ -11,6 +11,10 @@ from modules.video_state import video_at_end
 
 logger = Logger()
 
+# 元素可见性探测的硬超时(秒)。页面主线程被风控脚本阻塞时, evaluate 会永久
+# 挂起 —— init_page 里 Playwright 默认超时被设为 24 小时, 不设限就是静默死锁。
+ELEMENT_PROBE_TIMEOUT_S = 10
+
 VERIFICATION_SELECTORS = (
     ".yidun_popup .yidun_modal",
     ".yidun_modal__title",
@@ -26,8 +30,10 @@ BLOCKING_OVERLAY_SELECTORS = (
 async def has_visible_element(page: Page, selectors: tuple[str, ...]) -> bool:
     for selector in selectors:
         try:
-            visible = await page.locator(selector).evaluate_all(
-                """elements => elements.some(element => {
+            # 页面主线程被阻塞时 evaluate 永远不返回, 必须自己限时。
+            visible = await asyncio.wait_for(
+                page.locator(selector).evaluate_all(
+                    """elements => elements.some(element => {
                     const style = getComputedStyle(element);
                     const rect = element.getBoundingClientRect();
                     const opacity = Number.parseFloat(style.opacity || "1");
@@ -38,9 +44,17 @@ async def has_visible_element(page: Page, selectors: tuple[str, ...]) -> bool:
                         rect.bottom > 0 && rect.right > 0 &&
                         rect.top < innerHeight && rect.left < innerWidth;
                 })"""
+                ),
+                timeout=ELEMENT_PROBE_TIMEOUT_S,
             )
             if visible:
                 return True
+        except asyncio.TimeoutError:
+            logger.debug_throttled(
+                "has_visible_element",
+                f"可见元素检测超时({ELEMENT_PROBE_TIMEOUT_S}s, "
+                f"页面主线程可能被阻塞): {selector}",
+            )
         except TargetClosedError:
             raise
         except Exception as exc:
