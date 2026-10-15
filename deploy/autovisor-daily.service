@@ -9,10 +9,10 @@ Type=oneshot
 ExecStart=/usr/local/bin/autovisor-daily
 
 # 每门课的预算与课程间隔（分钟 / 秒）
-Environment=AV_MINUTES=26
+Environment=AV_MINUTES=30
 Environment=AV_GAP=60
 
-# 3 门课 x 26 分钟 + 间隔 + 浏览器启动开销，留足余量
+# 3 门课 x 30 分钟 + 间隔 + 浏览器启动开销，留足余量
 TimeoutStartSec=10800
 
 # 与 fuckzhs 隔离，各自独立目录

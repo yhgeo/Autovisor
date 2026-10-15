@@ -25,6 +25,10 @@ CATALOG_ATTACH_TIMEOUT_MS = 5_000
 # 目录检测的硬上限(秒)。页面主线程被阻塞时内部 deadline 永远到不了, 靠这层兜底。
 CATALOG_DETECT_HARD_TIMEOUT_S = 45
 
+# 课时播放停滞(120s 播放器无推进)时跳过继续; 连续这么多个才判定课程不可用。
+# 原实现是单个课时停滞即 FAILED, 会让整门课只跑几分钟就退出, 每日时长刷不满。
+MAX_CONSECUTIVE_STALLS = 5
+
 
 class CourseOutcome(Enum):
     COMPLETED = "completed"
@@ -105,6 +109,7 @@ async def run_course(
     start_time = time.time()
     paused_time = 0.0
     consecutive_failures = 0
+    consecutive_stalls = 0
     for index, lesson in enumerate(lessons):
         position = f"{index + 1}/{len(lessons)}"
         playback_enabled.clear()
@@ -172,17 +177,28 @@ async def run_course(
             logger.event("课程结果", 结果="达到时限", 课时数=len(lessons))
             return CourseOutcome.TIME_LIMIT
         if not completed:
+            # 单个课时播放停滞(播放器 120s 无推进)不再终止整门课:
+            # 跳过它继续下一课, 让剩余课时把当日时长刷够。
+            consecutive_stalls += 1
             logger.warn(
-                f'"{title}" 未能确认播放完成,本轮停止切换下一课.',
+                f'"{title}" 播放停滞, 跳过该课时继续下一课.',
                 shift=True,
             )
             logger.event(
-                "课程结果",
-                结果="课时未确认完成",
+                "课时停滞",
                 序号=position,
                 平台进度=f"{final_progress}%",
+                连续停滞=consecutive_stalls,
             )
-            return CourseOutcome.FAILED
+            if consecutive_stalls >= MAX_CONSECUTIVE_STALLS:
+                logger.error(
+                    f"连续 {MAX_CONSECUTIVE_STALLS} 个课时播放停滞, "
+                    "判定本课程不可用, 终止该课程."
+                )
+                logger.event("课程结果", 结果="连续课时停滞", 序号=position)
+                return CourseOutcome.FAILED
+            continue
+        consecutive_stalls = 0
 
         if index < len(lessons) - 1:
             logger.info(f'"{title}" 已完成!', shift=True)
