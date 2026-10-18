@@ -63,8 +63,11 @@ fi
 MODE="${AV_MODE:-daily}"
 
 if [ "$MODE" = "retry" ]; then
-    # 补跑模式: 解析当天日志, 只保留「没跑满时限」的课程。
-    # 达标 = 出现 结果=time_limit(跑满预算) 或 结果=completed(课时已全部学完)。
+    # 补跑模式: 解析当天日志, 只保留「没跑满」的课程。
+    # 注意: logger.event 的输出不进 daily 日志(只写 Log*.txt), 唯一可靠的
+    # 标记是调度脚本自己打的 ✓/✗ 行。
+    #   达标 = ✓ 课程 N 正常结束  (rc=0 且未因课时进度未确认而停)
+    #   未达标 = ✗ 课程 N 异常结束 / 当天无任何记录
     if [ ! -f "$DAYLOG" ]; then
         log "[补跑] 今日尚无运行记录, 跳过."
         exit 0
@@ -89,9 +92,9 @@ for line in lines:
         continue
     if not cur:
         continue
-    if re.search(r"课程结果 \| 结果=(time_limit|completed)\b", line):
+    if "正常结束" in line:
         status[cur] = "ok"
-    elif "结果=异常跳过" in line or re.search(r"课程结果 \| 结果=failed\b", line):
+    elif "异常结束" in line:
         status[cur] = "bad"
 
 for u in urls:

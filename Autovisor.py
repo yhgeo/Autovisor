@@ -53,6 +53,10 @@ COURSE_GOTO_TIMEOUT_MS = 60_000
 LOGIN_GOTO_TIMEOUT_MS = 60_000
 # 单门课运行的兜底余量(秒): limitMaxTime 之外再放宽这么多, 超时即跳过该课程。
 COURSE_RUN_GRACE_S = 600
+# 打开课程页失败(风控阻塞/目录检测超时)时的重试次数与间隔。
+# 这类失败是间歇性的, 重试通常就能恢复, 不该直接放弃整门课。
+COURSE_OPEN_RETRIES = 2
+COURSE_OPEN_RETRY_WAIT_S = 30
 
 # 获取全局事件循环
 event_loop_verify = asyncio.Event()
@@ -245,6 +249,52 @@ async def ensure_login(
     return False
 
 
+async def open_course(
+    page: Page, course_url: str, context: BrowserContext, config, modules, logger
+):
+    """打开课程页并识别目录; 失败时重试, 全部失败才抛出最后一个异常。
+
+    目录检测阶段的失败(风控阻塞、45s 硬超时)是间歇性的 —— 此时还没拿到
+    课时列表, 无法"跳到下一个视频", 只能重新打开页面再试一次。
+    """
+    last_exc = None
+    for attempt in range(COURSE_OPEN_RETRIES + 1):
+        try:
+            await page.goto(
+                course_url, wait_until="commit", timeout=COURSE_GOTO_TIMEOUT_MS
+            )
+            await page.wait_for_timeout(1500)
+            if "login" in page.url:
+                logger.warn(
+                    "播放页跳转到登录页, 当前登录状态已失效, 正在重新登录.",
+                    shift=True,
+                )
+                logger.event("登录失效", 地址=page.url)
+                clear_cookies(COOKIE_PATH)
+                remember_login_cookies(None)
+                await ensure_login(context, page, None, config, modules)
+                logger.info("重新进入播放页...")
+                await page.goto(
+                    course_url, wait_until="commit", timeout=COURSE_GOTO_TIMEOUT_MS
+                )
+                await page.wait_for_timeout(1500)
+            return await detect_catalog_after_verification(page, page.url)
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            if attempt >= COURSE_OPEN_RETRIES:
+                break
+            logger.warn(
+                f"打开课程页失败(第 {attempt + 1}/{COURSE_OPEN_RETRIES} 次), "
+                f"{COURSE_OPEN_RETRY_WAIT_S}s 后重试.",
+                shift=True,
+            )
+            logger.event("课程重试", 第几次=attempt + 1, 原因=str(exc)[:100])
+            await asyncio.sleep(COURSE_OPEN_RETRY_WAIT_S)
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("打开课程页失败")
+
+
 async def main(config) -> bool:
     modules, tasks = [], []
     playback_enabled = asyncio.Event()
@@ -293,30 +343,9 @@ async def main(config) -> bool:
                 # 单门课的故障(页面被风控阻塞/目录识别失败)不应拖垮整轮:
                 # 异常只跳过当前课程, 后续课程继续执行。
                 try:
-                    await page.goto(
-                        course_url,
-                        wait_until="commit",
-                        timeout=COURSE_GOTO_TIMEOUT_MS,
+                    catalog = await open_course(
+                        page, course_url, context, config, modules, logger
                     )
-                    await page.wait_for_timeout(1500)
-                    if "login" in page.url:
-                        logger.warn(
-                            "播放页跳转到登录页, 当前登录状态已失效, 正在重新登录.",
-                            shift=True,
-                        )
-                        logger.event("登录失效", 地址=page.url)
-                        clear_cookies(COOKIE_PATH)
-                        remember_login_cookies(None)
-                        await ensure_login(context, page, None, config, modules)
-                        logger.info("重新进入播放页...")
-                        await page.goto(
-                            course_url,
-                            wait_until="commit",
-                            timeout=COURSE_GOTO_TIMEOUT_MS,
-                        )
-                        await page.wait_for_timeout(1500)
-
-                    catalog = await detect_catalog_after_verification(page, page.url)
                     logger.info(f"检测到 {catalog.name} 课程目录.")
                     logger.context(目录类型=catalog.name)
                     logger.event("课程目录", 类型=catalog.name, 地址=page.url)
