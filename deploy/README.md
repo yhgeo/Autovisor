@@ -6,26 +6,31 @@
 
 | 文件 | 部署位置 | 作用 |
 |---|---|---|
-| `autovisor-daily` | `/usr/local/bin/autovisor-daily` | 每日刷课调度脚本：逐课程独立进程调用，各自独立时限，统计验证码命中 |
-| `autovisor-daily.service` | `/etc/systemd/system/` | oneshot 服务单元 |
-| `autovisor-daily.timer` | `/etc/systemd/system/` | 每天 09:00 触发，含 0-30 分钟随机延迟，`Persistent=true` 支持错过后补跑 |
+| `autovisor-daily` | `/usr/local/bin/` | 调度脚本：逐课程独立进程执行，各自独立时限 |
+| `autovisor-daily.service` | `/etc/systemd/system/` | 每日刷课服务 |
+| `autovisor-daily.timer` | `/etc/systemd/system/` | 每天 09:00 触发，含 0-30 分钟随机延迟 |
+| `autovisor-retry.service` | `/etc/systemd/system/` | 补跑服务（只重跑未达标的课程） |
+| `autovisor-retry.timer` | `/etc/systemd/system/` | 每天 13:00 / 16:30 各检查一次 |
 
 ## 安装
 
 ```bash
 install -m 755 autovisor-daily /usr/local/bin/autovisor-daily
-install -m 644 autovisor-daily.service autovisor-daily.timer /etc/systemd/system/
+install -m 644 autovisor-daily.service autovisor-daily.timer \
+               autovisor-retry.service autovisor-retry.timer \
+               /etc/systemd/system/
 
 systemctl daemon-reload
-systemctl enable --now autovisor-daily.timer
+systemctl enable --now autovisor-daily.timer autovisor-retry.timer
 ```
 
 ## 环境变量
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `AV_MINUTES` | 26 | 每门课的时限预算（分钟） |
+| `AV_MINUTES` | 30 | 每门课的时限预算（分钟） |
 | `AV_GAP` | 60 | 课程之间的间隔（秒） |
+| `AV_MODE` | `daily` | `daily` 跑全部课程；`retry` 只补跑当天未达标的课程 |
 | `AV_DRY_RUN` | — | 设为 `1` 时只打印计划，不实际执行 |
 
 临时改预算（只影响这一次）：
@@ -37,10 +42,10 @@ sudo AV_MINUTES=30 /usr/local/bin/autovisor-daily
 永久改预算：编辑 `autovisor-daily.service` 的 `Environment=AV_MINUTES`，然后
 `systemctl daemon-reload`。
 
-## 为什么逐课程独立进程
+## 补跑机制
 
-`main()` 在某门课返回 `FAILED` 时会 `break` 整轮，后面所有课程都不执行。
-拆成独立进程可保证「一门课卡住不拖垮其他课」，同时让每门课拿到独立的时限预算。
+`autovisor-retry.timer` 每天 13:00 与 16:30 各检查一次：读取当天的汇总日志，
+对**没有正常结束**的课程单独重新执行，已达标的课程不会再跑。
 
 ## 日志
 
@@ -49,7 +54,7 @@ sudo AV_MINUTES=30 /usr/local/bin/autovisor-daily
 
 ```bash
 # 看今天
-tail -50 /opt/autovisor/logs/daily-$(date +%F).log
+tail -50 /opt/autovisor/logs/$(date +%F).log
 
 # 看 systemd 层面
 journalctl -u autovisor-daily -n 50 --no-pager
@@ -60,5 +65,4 @@ journalctl -u autovisor-daily -n 50 --no-pager
 - 脚本从 `/opt/autovisor/config.ini` 的 `[course-url]` 段提取课程 URL，并为每门课
   派生独立配置到 `/opt/autovisor/run/course-N.ini`（仅覆盖 `limitMaxTime`）。
   **课程有变动时只需改主 `config.ini`。**
-- 与其它刷课工具（如 fuckZHS）**不要同时运行**：同一出口 IP 上并行两个自动化工具
-  会让风控特征叠加，且会使「是否撞验证码」的观测结果无法归因。
+- 同一时刻只运行一个实例：调度脚本已用 `flock` 保证；手动直跑时请自行确认。

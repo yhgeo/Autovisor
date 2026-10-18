@@ -95,11 +95,7 @@ cp config.macos.ini.example config.macos.ini
 
 #### 四、Linux 源码运行 (无头服务器)
 
-适用于没有图形界面的服务器 (Ubuntu 22.04 / 24.04 实测). 与 macOS 一样**以源码方式运行, 不需要编译**, 也不需要 PyInstaller.
-
-> **两点前置说明**
-> 1. `headless` 在代码中硬编码为 `False`, 因此**必须用 Xvfb 提供虚拟显示**; 不要改成 `headless=True` —— 自动过滑块的图像匹配 (`cv2.matchTemplate`) 与鼠标轨迹 (`page.mouse`) 都依赖真实渲染.
-> 2. `enableHideWindow` 是 Windows 专属实现 (`pygetwindow`), 在 Linux 上会自动跳过并打警告, 属正常现象. 用 Xvfb 时本就无可见窗口, 无需该项.
+适用于没有图形界面的服务器 (Ubuntu 22.04 / 24.04 实测). 以源码方式运行, 无需编译.
 
 **1) 系统依赖**
 
@@ -119,11 +115,11 @@ cd /opt/autovisor
 export UV_DEFAULT_INDEX=https://mirrors.aliyun.com/pypi/simple/
 export PLAYWRIGHT_DOWNLOAD_HOST=https://cdn.npmmirror.com/binaries/playwright
 
-uv sync --extra captcha                      # 含 numpy + opencv, 自动过滑块必需
+uv sync --extra captcha
 uv run playwright install --with-deps chromium
 ```
 
-> `--extra captcha` 不能省: `enableAutoCaptcha = True` 时程序会调用 `installer.start()` 加载 numpy/opencv, 缺少会直接报错退出.
+> `--extra captcha` 提供自动过滑块所需的图像处理依赖, 开启 `enableAutoCaptcha` 时不可省略.
 
 **3) 配置 `config.ini`**
 
@@ -131,15 +127,15 @@ uv run playwright install --with-deps chromium
 cp config.ini.example config.ini
 ```
 
-| 配置项 | 值 | 说明 |
+| 配置项 | 建议值 | 说明 |
 |---|---|---|
-| `driver` | `chromium` | Linux 没有 Edge, 用 Playwright 自带 Chromium |
-| `enableAutoCaptcha` | `True` | 开启自动过滑块; 同时决定 numpy/opencv 是否加载 |
-| `enableHideWindow` | `False` | Linux 上无效, 保持默认 |
+| `driver` | `chromium` | Linux 没有 Edge, 使用 Playwright 自带的 Chromium |
+| `enableAutoCaptcha` | `True` | 自动完成登录页的滑块验证 |
+| `enableHideWindow` | `False` | Linux 上无需该项 |
 | `limitMaxTime` | 每门课时限 (分钟) | 每门课独立计时 |
-| `username` / `password` | 填账号密码 | 见下 |
+| `username` / `password` | 你的账号密码 | 推荐使用账号密码登录 |
 
-**登录方式**: 优先填账号密码. 实测在机房 IP 上, 浏览器填表登录可**一次通过易盾滑块**; 而直接复用其他机器 (不同出口 IP) 导出的 cookie 会被判失效并跳回登录页.
+服务器上无法手动操作浏览器, 直接填写账号密码即可让程序自动登录.
 
 **4) 运行**
 
@@ -148,34 +144,27 @@ xvfb-run -a --server-args="-screen 0 1920x1080x24" \
   .venv/bin/python -u Autovisor.py --config config.ini
 ```
 
-建议加 `-u`: 否则 stdout 被缓冲, 日志要等进程结束才落盘 (程序自身的 `logs/LogN.txt` 始终实时).
+**5) 定时任务**
 
-**5) 定时任务 (systemd)**
+`deploy/` 目录提供现成的调度脚本与 systemd 单元:
 
-单课程跑失败时 `main()` 会 `break` 整轮, 因此推荐**逐课程独立进程**调用:
+| 文件 | 作用 |
+|---|---|
+| `autovisor-daily` | 逐课程独立进程执行, 每门课独立计时, 单课失败不影响其他课程 |
+| `autovisor-daily.service` / `.timer` | 每日定时执行 |
+| `autovisor-retry.service` / `.timer` | 定时检查, 自动补跑未达标的课程 |
 
 ```bash
-#!/bin/bash
-set -uo pipefail
-BASE=/opt/autovisor; PY="$BASE/.venv/bin/python"; MINUTES="${AV_MINUTES:-26}"
-mapfile -t URLS < <(grep -E '^[[:space:]]*URL[0-9]+[[:space:]]*=' "$BASE/config.ini" \
-                    | sed -E 's/^[^=]*=[[:space:]]*//' | grep -v '^[[:space:]]*$')
-for i in "${!URLS[@]}"; do
-    xvfb-run -a --server-args="-screen 0 1920x1080x24" \
-      "$PY" Autovisor.py --config "$BASE/run/course-$((i+1)).ini"
-done
+cp deploy/autovisor-daily /usr/local/bin/
+chmod +x /usr/local/bin/autovisor-daily
+cp deploy/autovisor-daily.service deploy/autovisor-daily.timer \
+   deploy/autovisor-retry.service deploy/autovisor-retry.timer \
+   /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now autovisor-daily.timer autovisor-retry.timer
 ```
 
-完整的调度脚本、systemd 单元与 timer 见仓库 `deploy/` 目录.
-
-**6) 常见坑**
-
-| 现象 | 原因 | 处理 |
-|---|---|---|
-| 启动即 `NameError: name 'packages' is not defined` | `installer.start()` 非 Windows 分支引用了未定义变量; 因 macOS 模板默认 `enableAutoCaptcha=False`, 该分支长期未被触发 | 本仓库已修复 |
-| 单个课时点不中, 整轮直接终止 | `run_course()` 原为 `return CourseOutcome.FAILED` | 本仓库已改为跳过并计数 |
-| 课中弹出安全验证后永久卡住 | `wait_for_verify` 只做弹窗 + 死等真人 | 本仓库已接入 `slider_verify` 自动过滑块 |
-| 内存吃紧 / 偶发崩溃 | Chromium 约 400 MB | 2 GB 内存可跑单实例, 不要并发多个 |
+> 2 GB 内存的服务器只够跑一个实例, 调度脚本已用 `flock` 防止并发.
 
 #### 五、发行版下载
 
