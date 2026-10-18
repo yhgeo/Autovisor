@@ -1,0 +1,13 @@
+[Unit]
+Description=Autovisor 补跑检查（每天 13:00 与 16:30）
+
+[Timer]
+# 主任务约 09:00-11:00 跑完, 13:00 第一次检查补跑, 16:30 再兜一次
+OnCalendar=*-*-* 13:00:00
+OnCalendar=*-*-* 16:30:00
+# 随机延后 0-5 分钟, 避免整点特征
+RandomizedDelaySec=300
+Persistent=false
+
+[Install]
+WantedBy=timers.target

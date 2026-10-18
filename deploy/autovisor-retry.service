@@ -1,0 +1,19 @@
+[Unit]
+Description=Autovisor 补跑（仅重跑当日未达标的课程）
+Documentation=https://github.com/yhgeo/Autovisor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/autovisor-daily
+
+# AV_MODE=retry: 解析当天日志, 只对没跑满时限的课程重新执行
+Environment=AV_MODE=retry
+Environment=AV_MINUTES=30
+Environment=AV_GAP=60
+
+# 补跑最多 2 门 x 30 分钟 + 开销
+TimeoutStartSec=10800
+
+WorkingDirectory=/opt/autovisor

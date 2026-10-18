@@ -12,6 +12,7 @@
 # 环境变量：
 #   AV_MINUTES    每门课预算（分钟），默认 30
 #   AV_GAP        课程之间间隔（秒），默认 60
+#   AV_MODE       daily(默认) 全跑 / retry 只补跑当天未达标的课程
 #   AV_DRY_RUN=1  只打印计划，不实际执行
 #
 # 用法：
@@ -59,7 +60,53 @@ if [ ${#URLS[@]} -eq 0 ]; then
     exit 1
 fi
 
-log "=== 每日刷课开始: ${#URLS[@]} 门课, 每门 ${MINUTES} 分钟, 间隔 ${GAP}s ==="
+MODE="${AV_MODE:-daily}"
+
+if [ "$MODE" = "retry" ]; then
+    # 补跑模式: 解析当天日志, 只保留「没跑满时限」的课程。
+    # 达标 = 出现 结果=time_limit(跑满预算) 或 结果=completed(课时已全部学完)。
+    if [ ! -f "$DAYLOG" ]; then
+        log "[补跑] 今日尚无运行记录, 跳过."
+        exit 0
+    fi
+    mapfile -t URLS < <("$PY" - "$DAYLOG" "${URLS[@]}" <<'RETRYEOF'
+import re
+import sys
+
+path, urls = sys.argv[1], sys.argv[2:]
+status = {u: None for u in urls}
+cur = None
+try:
+    lines = open(path, encoding="utf-8", errors="replace").read().splitlines()
+except OSError:
+    lines = []
+
+for line in lines:
+    m = re.search(r"--- \[\d+/\d+\] 预算 \d+min\s+URL=(\S+)", line)
+    if m:
+        prefix = m.group(1)  # 日志里的 URL 被截断到 70 字符, 用前缀匹配
+        cur = next((u for u in urls if u.startswith(prefix)), None)
+        continue
+    if not cur:
+        continue
+    if re.search(r"课程结果 \| 结果=(time_limit|completed)\b", line):
+        status[cur] = "ok"
+    elif "结果=异常跳过" in line or re.search(r"课程结果 \| 结果=failed\b", line):
+        status[cur] = "bad"
+
+for u in urls:
+    if status.get(u) != "ok":
+        print(u)
+RETRYEOF
+)
+    if [ ${#URLS[@]} -eq 0 ]; then
+        log "[补跑] 今日课程均已达标, 无需补跑."
+        exit 0
+    fi
+    log "=== 补跑开始: ${#URLS[@]} 门课未达标, 每门 ${MINUTES} 分钟 ==="
+else
+    log "=== 每日刷课开始: ${#URLS[@]} 门课, 每门 ${MINUTES} 分钟, 间隔 ${GAP}s ==="
+fi
 
 # ---------- 为每门课生成独立配置 ----------
 gen_conf() {
