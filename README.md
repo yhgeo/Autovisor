@@ -152,7 +152,7 @@ xvfb-run -a --server-args="-screen 0 1920x1080x24" \
 |---|---|
 | `autovisor-daily` | 逐课程独立进程执行, 每门课独立计时, 单课失败不影响其他课程 |
 | `autovisor-daily.service` / `.timer` | 每日定时执行 |
-| `autovisor-retry.service` / `.timer` | 定时检查, 自动补跑未达标的课程 |
+| `autovisor-retry.service` / `.timer` | 定时检查, 按当日累计时长补跑不足的课程 |
 
 ```bash
 cp deploy/autovisor-daily /usr/local/bin/
