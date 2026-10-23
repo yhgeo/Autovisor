@@ -8,11 +8,14 @@
 #   3. 课程之间留间隔，避免连续高强度行为。
 #   4. 全程 Xvfb，无可见窗口。
 #   5. 统计「撞到安全验证」的课程数，便于判断风控强度。
+#   6. 按「实际运行时长」判定达标，而不是只看退出码 ——
+#      课程学完后会提前正常退出（rc=0），但当日时长可能不足 25 分钟。
 #
 # 环境变量：
 #   AV_MINUTES    每门课预算（分钟），默认 30
 #   AV_GAP        课程之间间隔（秒），默认 60
-#   AV_MODE       daily(默认) 全跑 / retry 只补跑当天未达标的课程
+#   AV_MODE       daily(默认) 全跑 / retry 只补跑当天时长不足的课程
+#   AV_TOLERANCE  允许的收尾误差（分钟），默认 1
 #   AV_DRY_RUN=1  只打印计划，不实际执行
 #
 # 用法：
@@ -28,6 +31,7 @@ LOG_DIR="$BASE/logs"
 RUN_DIR="$BASE/run"
 MINUTES="${AV_MINUTES:-30}"
 GAP="${AV_GAP:-60}"
+TOLERANCE="${AV_TOLERANCE:-1}"
 
 mkdir -p "$LOG_DIR" "$RUN_DIR"
 DAYLOG="$LOG_DIR/daily-$(date +%F).log"
@@ -62,59 +66,94 @@ fi
 
 MODE="${AV_MODE:-daily}"
 
+# 每门课的预算, 默认全部为 AV_MINUTES; 补跑模式下按缺口计算
+BUDGETS=()
+for _ in "${URLS[@]}"; do BUDGETS+=("$MINUTES"); done
+
 if [ "$MODE" = "retry" ]; then
-    # 补跑模式: 解析当天日志, 只保留「没跑满」的课程。
-    # 注意: logger.event 的输出不进 daily 日志(只写 Log*.txt), 唯一可靠的
-    # 标记是调度脚本自己打的 ✓/✗ 行。
-    #   达标 = ✓ 课程 N 正常结束  (rc=0 且未因课时进度未确认而停)
-    #   未达标 = ✗ 课程 N 异常结束 / 当天无任何记录
+    # 补跑模式: 解析当天日志, 只保留「累计时长不足」的课程。
+    #   - 按 URL 累加当天每次运行的耗时（平台的学习时长本来就是按天累加的）
+    #   - 缺口 = AV_MINUTES - 累计时长; 缺口 < AV_TOLERANCE 视为已达标
+    #   - 补跑预算 = 缺口（至少 5 分钟），避免重复跑满 30 分钟
     if [ ! -f "$DAYLOG" ]; then
         log "[补跑] 今日尚无运行记录, 跳过."
         exit 0
     fi
-    mapfile -t URLS < <("$PY" - "$DAYLOG" "${URLS[@]}" <<'RETRYEOF'
+
+    mapfile -t PLAN < <("$PY" - "$DAYLOG" "$MINUTES" "$TOLERANCE" "${URLS[@]}" <<'RETRYEOF'
+import math
 import re
 import sys
 
-path, urls = sys.argv[1], sys.argv[2:]
-status = {u: None for u in urls}
+path = sys.argv[1]
+budget = float(sys.argv[2])
+tolerance = float(sys.argv[3])
+urls = sys.argv[4:]
+
+spent = {u: 0.0 for u in urls}
+hit_limit = {u: False for u in urls}
 cur = None
+
+# 课程分隔行: --- [1/2] 预算 30min  URL=https://...(完整 URL) ---
+RE_START = re.compile(r"--- \[\d+/\d+\] 预算 [\d.]+min\s+URL=(\S+)")
+# 结果行:   ✓ 课程 1 达标 用时 30.6m
+#           ✗ 课程 2 时长不足 用时 15.7m rc=0
+#           ✗ 课程 2 异常结束 用时 0.4m rc=1
+RE_RESULT = re.compile(r"课程 \d+ (达标|时长不足|异常结束).*?用时 ([\d.]+)m")
+
 try:
     lines = open(path, encoding="utf-8", errors="replace").read().splitlines()
 except OSError:
     lines = []
 
 for line in lines:
-    m = re.search(r"--- \[\d+/\d+\] 预算 \d+min\s+URL=(\S+)", line)
+    m = RE_START.search(line)
     if m:
-        prefix = m.group(1)  # 日志里的 URL 被截断到 70 字符, 用前缀匹配
-        cur = next((u for u in urls if u.startswith(prefix)), None)
+        logged = m.group(1)
+        # 完整 URL 精确匹配; 兼容历史日志里被截断到 70 字符的写法
+        cur = next((u for u in urls if u == logged), None)
+        if cur is None:
+            cur = next((u for u in urls if u.startswith(logged)), None)
         continue
-    if not cur:
+    if cur is None:
         continue
-    if "正常结束" in line:
-        status[cur] = "ok"
-    elif "异常结束" in line:
-        status[cur] = "bad"
+    if "当前课程已达时限" in line:
+        hit_limit[cur] = True
+    m = RE_RESULT.search(line)
+    if m:
+        spent[cur] += float(m.group(2))
 
 for u in urls:
-    if status.get(u) != "ok":
-        print(u)
+    if hit_limit[u]:
+        continue
+    short = budget - spent[u]
+    if short < tolerance:
+        continue
+    topup = max(5.0, math.ceil(short))
+    print("%s\t%d" % (u, topup))
 RETRYEOF
 )
-    if [ ${#URLS[@]} -eq 0 ]; then
-        log "[补跑] 今日课程均已达标, 无需补跑."
+
+    if [ ${#PLAN[@]} -eq 0 ]; then
+        log "[补跑] 今日课程时长均已达标, 无需补跑."
         exit 0
     fi
-    log "=== 补跑开始: ${#URLS[@]} 门课未达标, 每门 ${MINUTES} 分钟 ==="
+
+    URLS=()
+    BUDGETS=()
+    for line in "${PLAN[@]}"; do
+        URLS+=("${line%%$'\t'*}")
+        BUDGETS+=("${line##*$'\t'}")
+    done
+    log "=== 补跑开始: ${#URLS[@]} 门课时长不足 ==="
 else
     log "=== 每日刷课开始: ${#URLS[@]} 门课, 每门 ${MINUTES} 分钟, 间隔 ${GAP}s ==="
 fi
 
 # ---------- 为每门课生成独立配置 ----------
 gen_conf() {
-    local idx="$1" url="$2" out="$3"
-    "$PY" - "$MAIN_CONF" "$out" "$url" "$MINUTES" <<'PYEOF'
+    local url="$1" out="$2" minutes="$3"
+    "$PY" - "$MAIN_CONF" "$out" "$url" "$minutes" <<'PYEOF'
 import configparser, sys
 src, out, url, minutes = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 c = configparser.ConfigParser()
@@ -133,12 +172,13 @@ PYEOF
 
 ok=0; failed=0; captcha=0; idx=0
 for url in "${URLS[@]}"; do
+    budget="${BUDGETS[$idx]:-$MINUTES}"
     idx=$((idx + 1))
     conf="$RUN_DIR/course-${idx}.ini"
-    gen_conf "$idx" "$url" "$conf"
+    gen_conf "$url" "$conf" "$budget"
 
     if [ "${AV_DRY_RUN:-0}" = "1" ]; then
-        log "--- [$idx/${#URLS[@]}] [dry-run] 预算 ${MINUTES}min  URL=${url:0:70} ---"
+        log "--- [$idx/${#URLS[@]}] [dry-run] 预算 ${budget}min  URL=$url ---"
         log "  [dry-run] xvfb-run $PY Autovisor.py --config $conf"
         continue
     fi
@@ -147,26 +187,38 @@ for url in "${URLS[@]}"; do
         log "课程间隔 ${GAP}s..."
         sleep "$GAP"
     fi
-    log "--- [$idx/${#URLS[@]}] 预算 ${MINUTES}min  URL=${url:0:70} ---"
+    log "--- [$idx/${#URLS[@]}] 预算 ${budget}min  URL=$url ---"
 
+    started=$(date +%s)
     out=$(cd "$BASE" && xvfb-run -a --server-args="-screen 0 1920x1080x24" \
           "$PY" Autovisor.py --config "$conf" 2>&1)
     rc=$?
-    { echo "===== 课程 $idx @ $(date '+%F %T') rc=$rc ====="; echo "$out"; } >> "$DAYLOG"
+    ended=$(date +%s)
+    elapsed=$(awk "BEGIN{printf \"%.1f\", ($ended - $started) / 60}")
+    { echo "===== 课程 $idx @ $(date '+%F %T') rc=$rc 用时=${elapsed}m ====="; echo "$out"; } >> "$DAYLOG"
 
     hit=0
     if echo "$out" | grep -q "检测到安全验证"; then
         hit=1; captcha=$((captcha + 1))
     fi
 
-    if [ "$rc" -eq 0 ] && ! echo "$out" | grep -q "本轮因课时进度未确认而停止"; then
+    # 达标判定: 退出码正常 + 课时进度未被中断 + 实际跑够预算(允许收尾误差)
+    limit_hit=0
+    echo "$out" | grep -q "当前课程已达时限" && limit_hit=1
+
+    if [ "$rc" -eq 0 ] \
+       && ! echo "$out" | grep -q "本轮因课时进度未确认而停止" \
+       && { [ "$limit_hit" = 1 ] || awk "BEGIN{exit !($elapsed >= $budget - $TOLERANCE)}"; }; then
         ok=$((ok + 1))
-        log "  ✓ 课程 $idx 正常结束$([ "$hit" = 1 ] && echo ' (期间出现过安全验证)')"
+        log "  ✓ 课程 $idx 达标 用时 ${elapsed}m$([ "$hit" = 1 ] && echo ' (期间出现过安全验证)')"
+    elif [ "$rc" -ne 0 ] || echo "$out" | grep -q "本轮因课时进度未确认而停止"; then
+        failed=$((failed + 1))
+        log "  ✗ 课程 $idx 异常结束 用时 ${elapsed}m rc=$rc$([ "$hit" = 1 ] && echo ' (撞到安全验证)')"
     else
         failed=$((failed + 1))
-        log "  ✗ 课程 $idx 异常结束 rc=$rc$([ "$hit" = 1 ] && echo ' (撞到安全验证)')"
+        log "  ✗ 课程 $idx 时长不足 用时 ${elapsed}m rc=$rc (预算 ${budget}min)"
     fi
 done
 
-log "=== 结束: 正常 $ok / 异常 $failed / 撞验证 $captcha ==="
+log "=== 结束: 达标 $ok / 未达标 $failed / 撞验证 $captcha ==="
 exit 0
