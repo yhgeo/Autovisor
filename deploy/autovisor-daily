@@ -84,6 +84,7 @@ if [ "$MODE" = "retry" ]; then
 import math
 import re
 import sys
+from datetime import datetime
 
 path = sys.argv[1]
 budget = float(sys.argv[2])
@@ -93,12 +94,19 @@ urls = sys.argv[4:]
 spent = {u: 0.0 for u in urls}
 hit_limit = {u: False for u in urls}
 cur = None
+cur_start = None
 
-# 课程分隔行: --- [1/2] 预算 30min  URL=https://...(完整 URL) ---
-RE_START = re.compile(r"--- \[\d+/\d+\] 预算 [\d.]+min\s+URL=(\S+)")
-# 结果行:   ✓ 课程 1 达标 用时 30.6m
-#           ✗ 课程 2 时长不足 用时 15.7m rc=0
-#           ✗ 课程 2 异常结束 用时 0.4m rc=1
+# 课程开始行: [2026-10-23 09:36:28] --- [2/2] 预算 30min  URL=https://... ---
+RE_START = re.compile(
+    r"^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\] --- \[\d+/\d+\] "
+    r"预算 [\d.]+min\s+URL=(\S+)"
+)
+# 课程结束行: ===== 课程 2 @ 2026-10-23 10:07:06 rc=0 用时=30.6m =====
+# 耗时直接用「结束时间 - 开始时间」算, 新旧格式日志都适用。
+RE_END = re.compile(
+    r"^===== 课程 \d+ @ (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) rc="
+)
+# 兜底: 结果行里的 用时 X.Xm (当日志缺少结束行时)
 RE_RESULT = re.compile(r"课程 \d+ (达标|时长不足|异常结束).*?用时 ([\d.]+)m")
 
 try:
@@ -109,19 +117,27 @@ except OSError:
 for line in lines:
     m = RE_START.search(line)
     if m:
-        logged = m.group(1)
+        logged = m.group(2)
         # 完整 URL 精确匹配; 兼容历史日志里被截断到 70 字符的写法
         cur = next((u for u in urls if u == logged), None)
         if cur is None:
             cur = next((u for u in urls if u.startswith(logged)), None)
+        cur_start = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")
         continue
     if cur is None:
         continue
     if "当前课程已达时限" in line:
         hit_limit[cur] = True
+    m = RE_END.search(line)
+    if m and cur_start is not None:
+        end = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")
+        spent[cur] += max(0.0, (end - cur_start).total_seconds() / 60)
+        cur_start = None
+        continue
     m = RE_RESULT.search(line)
-    if m:
+    if m and cur_start is not None:
         spent[cur] += float(m.group(2))
+        cur_start = None
 
 for u in urls:
     if hit_limit[u]:
